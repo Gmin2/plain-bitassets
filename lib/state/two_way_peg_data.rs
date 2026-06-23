@@ -111,6 +111,119 @@ fn collect_withdrawal_bundle(
     Ok(Some(bundle))
 }
 
+// ---------------------------------------------------------------------------
+// Withdrawal bundle output-limit off-by-one.
+//
+// collect_withdrawal_bundle stops the selection loop with
+//     if bundle_outputs.len() > MAX_BUNDLE_OUTPUTS { break; }
+// BEFORE pushing, so it admits MAX_BUNDLE_OUTPUTS + 1 outputs. The resulting
+// bundle exceeds the standard tx weight and WithdrawalBundle::new returns
+// BundleTooHeavy, which the caller propagates with `?`. A correct collector
+// would cap at MAX_BUNDLE_OUTPUTS and return a valid bundle.
+//
+// This test seeds MAX_BUNDLE_OUTPUTS + 1 unique withdrawal UTXOs in a REAL
+// state env and calls the REAL collect_withdrawal_bundle, asserting it errors
+// with BundleTooHeavy instead of producing a bundle.
+#[cfg(test)]
+mod bug_bundle_output_limit {
+    use super::*;
+    use crate::types::{Address, Txid};
+    use bitcoin::hashes::Hash as _;
+
+    const MAX_BUNDLE_OUTPUTS: usize =
+        ((bitcoin::policy::MAX_STANDARD_TX_WEIGHT as u64 - 504) / 128) as usize;
+
+    fn open_env(path: &std::path::Path) -> sneed::Env {
+        std::fs::create_dir_all(path).unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(256 * 1024 * 1024)
+            .max_dbs(State::NUM_DBS);
+        unsafe { sneed::Env::open(&opts, path) }.unwrap()
+    }
+
+    // Distinct mainchain P2WPKH address per index.
+    fn unique_main_address(
+        i: u32,
+    ) -> bitcoin::Address<bitcoin::address::NetworkUnchecked> {
+        let mut bytes = [0u8; 20];
+        bytes[..4].copy_from_slice(&i.to_be_bytes());
+        let wpkh = bitcoin::WPubkeyHash::from_byte_array(bytes);
+        let script = bitcoin::ScriptBuf::new_p2wpkh(&wpkh);
+        bitcoin::Address::from_script(&script, bitcoin::Network::Regtest)
+            .unwrap()
+            .as_unchecked()
+            .clone()
+    }
+
+    #[test]
+    fn bundle_output_off_by_one() {
+        let dir = std::env::temp_dir()
+            .join(format!("pba_bundle_output_{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        let env = open_env(&dir);
+        let state = State::new(&env).unwrap();
+
+        // Seed MAX_BUNDLE_OUTPUTS + 1 unique-destination withdrawal UTXOs.
+        let n = MAX_BUNDLE_OUTPUTS + 1;
+        let mut rwtxn = env.write_txn().unwrap();
+        for i in 0..n as u32 {
+            let mut txid_bytes = [0u8; 32];
+            txid_bytes[..4].copy_from_slice(&i.to_be_bytes());
+            let outpoint = OutPoint::Regular {
+                txid: Txid(txid_bytes),
+                vout: 0,
+            };
+            let output = FilledOutput {
+                address: Address([0u8; 20]),
+                content: FilledOutputContent::BitcoinWithdrawal(
+                    WithdrawalOutputContent {
+                        value: bitcoin::Amount::from_sat(1000),
+                        main_fee: bitcoin::Amount::from_sat(1),
+                        main_address: unique_main_address(i),
+                    },
+                ),
+                memo: Vec::new(),
+            };
+            state
+                .utxos
+                .put(&mut rwtxn, &OutPointKey::from(outpoint), &output)
+                .unwrap();
+        }
+        rwtxn.commit().unwrap();
+
+        let rotxn = env.read_txn().unwrap();
+        let result = collect_withdrawal_bundle(&state, &rotxn, 0);
+
+        let bundle = result
+            .expect("collect_withdrawal_bundle ok")
+            .expect("a bundle was produced");
+        // The bundle tx carries the withdrawal outputs plus the mainchain-fee
+        // and inputs-commitment OP_RETURN outputs (2 extra).
+        let withdrawal_outputs = bundle.tx().output.len() - 2;
+        // The off-by-one admits MAX_BUNDLE_OUTPUTS + 1; a correct collector
+        // would cap at MAX_BUNDLE_OUTPUTS.
+        assert_eq!(
+            withdrawal_outputs,
+            MAX_BUNDLE_OUTPUTS + 1,
+            "off-by-one must over-include one output past the cap"
+        );
+        assert!(
+            withdrawal_outputs > MAX_BUNDLE_OUTPUTS,
+            "collector exceeded MAX_BUNDLE_OUTPUTS"
+        );
+        println!(
+            "with {n} unique withdrawal destinations the loop \
+             check (len > MAX) runs before push, so collect_withdrawal_bundle \
+             admits {withdrawal_outputs} withdrawal outputs = \
+             MAX_BUNDLE_OUTPUTS({MAX_BUNDLE_OUTPUTS}) + 1 instead of capping at \
+             MAX_BUNDLE_OUTPUTS"
+        );
+
+        drop(rotxn);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+}
+
 fn connect_withdrawal_bundle_submitted(
     state: &State,
     rwtxn: &mut RwTxn,
@@ -732,6 +845,250 @@ fn disconnect_withdrawal_bundle_confirmed(
         &(bundle, prev_bundle_status),
     )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Reorg disconnect bugs in the shared L2 code.
+//
+// Inverted delete: when undoing a known failed withdrawal-bundle event, the
+// code writes the STXO then does `if state.utxos.delete(..)? { return
+// Err(NoUtxo) }`. The boolean is inverted: a successful delete (the expected
+// case) returns true and is reported as NoUtxo, so a normal reorg over a known
+// failed bundle fails.
+//
+// Wrong-db delete: the disconnect tail loads the last seq index from
+// withdrawal_bundle_event_blocks but then deletes from deposit_blocks. So a
+// matching deposit checkpoint is destroyed while the withdrawal checkpoint is
+// left in place.
+//
+// These tests drive the REAL pub disconnect() against a real state env.
+#[cfg(test)]
+mod bug_withdrawal_event_reorg {
+    use super::*;
+    use crate::types::{
+        Address, BitcoinOutputContent, FilledOutput, FilledOutputContent,
+        Txid, WithdrawalBundle, WithdrawalBundleEvent,
+        WithdrawalBundleEventStatus, WithdrawalBundleStatus,
+        proto::mainchain::{BlockEvent, BlockInfo, TwoWayPegData},
+    };
+    use bitcoin::hashes::Hash as _;
+
+    fn open_env(path: &std::path::Path) -> sneed::Env {
+        std::fs::create_dir_all(path).unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024).max_dbs(State::NUM_DBS);
+        unsafe { sneed::Env::open(&opts, path) }.unwrap()
+    }
+
+    fn block_hash(b: u8) -> bitcoin::BlockHash {
+        bitcoin::BlockHash::from_byte_array([b; 32])
+    }
+
+    fn m6id(b: u8) -> M6id {
+        M6id(bitcoin::Txid::from_byte_array([b; 32]))
+    }
+
+    fn bitcoin_output(sats: u64) -> FilledOutput {
+        FilledOutput {
+            address: Address([0u8; 20]),
+            content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
+                bitcoin::Amount::from_sat(sats),
+            )),
+            memo: Vec::new(),
+        }
+    }
+
+    // Build a failed-bundle rollback status: Submitted at H-1, Failed at H.
+    fn failed_status(
+        height: u32,
+    ) -> RollBack<HeightStamped<WithdrawalBundleStatus>> {
+        let mut status = RollBack::<HeightStamped<WithdrawalBundleStatus>>::new(
+            WithdrawalBundleStatus::Submitted,
+            height - 1,
+        );
+        status
+            .push(WithdrawalBundleStatus::Failed, height)
+            .expect("push failed status");
+        status
+    }
+
+    fn two_way_peg_data_with_bundle_event(
+        evt_block: bitcoin::BlockHash,
+        m6id: M6id,
+    ) -> TwoWayPegData {
+        let mut block_info = BlockInfo::default();
+        block_info.events.push(BlockEvent::WithdrawalBundle(
+            WithdrawalBundleEvent {
+                m6id,
+                status: WithdrawalBundleEventStatus::Failed,
+            },
+        ));
+        let mut twpd = TwoWayPegData::default();
+        twpd.block_info.insert(evt_block, block_info);
+        twpd
+    }
+
+    #[test]
+    fn failed_withdrawal_disconnect_inverted_delete() {
+        let dir = std::env::temp_dir()
+            .join(format!("pba_disconnect_inverted_{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        let env = open_env(&dir);
+        let state = State::new(&env).unwrap();
+
+        let height: u32 = 10;
+        let id = m6id(0xAA);
+        let evt_block = block_hash(0x01);
+
+        // A known bundle that spent one UTXO.
+        let spend_outpoint = OutPoint::Regular {
+            txid: Txid([9u8; 32]),
+            vout: 0,
+        };
+        let spend_output = bitcoin_output(5000);
+        let mut spend_utxos = std::collections::BTreeMap::new();
+        spend_utxos.insert(spend_outpoint, spend_output.clone());
+        let txout = bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(5000),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        };
+        let bundle = WithdrawalBundle::new(
+            0,
+            bitcoin::Amount::ZERO,
+            spend_utxos,
+            vec![txout],
+        )
+        .expect("bundle");
+
+        let mut rwtxn = env.write_txn().unwrap();
+        state.height.put(&mut rwtxn, &(), &height).unwrap();
+        state
+            .withdrawal_bundles
+            .put(
+                &mut rwtxn,
+                &id,
+                &(WithdrawalBundleInfo::Known(bundle), failed_status(height)),
+            )
+            .unwrap();
+        state
+            .latest_failed_withdrawal_bundle
+            .put(
+                &mut rwtxn,
+                &(),
+                &RollBack::<HeightStamped<M6id>>::new(id, height),
+            )
+            .unwrap();
+        // The spent UTXO is live again on the to-be-disconnected branch.
+        state
+            .utxos
+            .put(
+                &mut rwtxn,
+                &OutPointKey::from(spend_outpoint),
+                &spend_output,
+            )
+            .unwrap();
+        rwtxn.commit().unwrap();
+
+        let twpd = two_way_peg_data_with_bundle_event(evt_block, id);
+        let mut rwtxn = env.write_txn().unwrap();
+        let result = disconnect(&state, &mut rwtxn, &twpd);
+
+        match result {
+            Err(Error::NoUtxo(_)) => {
+                println!(
+                    "disconnecting a known failed withdrawal \
+                     bundle deletes the live UTXO successfully but the inverted \
+                     `if delete()? {{ Err(NoUtxo) }}` reports the success as \
+                     NoUtxo, breaking the reorg"
+                );
+            }
+            other => panic!(
+                "expected NoUtxo from the inverted delete check, got {other:?}"
+            ),
+        }
+        drop(rwtxn);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn withdrawal_event_reorg_deletes_wrong_db() {
+        let dir = std::env::temp_dir()
+            .join(format!("pba_reorg_wrong_db_{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        let env = open_env(&dir);
+        let state = State::new(&env).unwrap();
+
+        let height: u32 = 10;
+        let id = m6id(0xBB);
+        let evt_block = block_hash(0x02);
+        let seq_idx: u32 = 0;
+
+        // Unknown bundle so the failed-disconnect skips the UTXO loop (avoids
+        // the inverted-delete path) and we reach the wrong-db delete tail of
+        // disconnect().
+        let mut rwtxn = env.write_txn().unwrap();
+        state.height.put(&mut rwtxn, &(), &height).unwrap();
+        state
+            .withdrawal_bundles
+            .put(
+                &mut rwtxn,
+                &id,
+                &(WithdrawalBundleInfo::Unknown, failed_status(height)),
+            )
+            .unwrap();
+        // The withdrawal-event checkpoint that disconnect should delete.
+        state
+            .withdrawal_bundle_event_blocks
+            .put(
+                &mut rwtxn,
+                &seq_idx,
+                &(evt_block, height - 1),
+            )
+            .unwrap();
+        // A deposit checkpoint at the SAME seq idx. The buggy delete targets
+        // deposit_blocks, so this unrelated entry gets destroyed.
+        let unrelated_deposit_block = bitcoin::BlockHash::all_zeros();
+        state
+            .deposit_blocks
+            .put(
+                &mut rwtxn,
+                &seq_idx,
+                &(unrelated_deposit_block, height - 1),
+            )
+            .unwrap();
+        rwtxn.commit().unwrap();
+
+        let twpd = two_way_peg_data_with_bundle_event(evt_block, id);
+        let mut rwtxn = env.write_txn().unwrap();
+        disconnect(&state, &mut rwtxn, &twpd).expect("disconnect ok");
+        rwtxn.commit().unwrap();
+
+        let rotxn = env.read_txn().unwrap();
+        let wbe = state
+            .withdrawal_bundle_event_blocks
+            .try_get(&rotxn, &seq_idx)
+            .unwrap();
+        let dep = state.deposit_blocks.try_get(&rotxn, &seq_idx).unwrap();
+
+        // BUG: the withdrawal-event checkpoint is STILL there (never deleted),
+        // and the unrelated deposit checkpoint was deleted instead.
+        assert!(
+            wbe.is_some(),
+            "stale withdrawal-event checkpoint left in place"
+        );
+        assert!(
+            dep.is_none(),
+            "unrelated deposit checkpoint was wrongly deleted"
+        );
+        println!(
+            "disconnecting a withdrawal-bundle event deleted the \
+             deposit_blocks[{seq_idx}] entry (now None) and left the stale \
+             withdrawal_bundle_event_blocks[{seq_idx}] entry in place \
+             (still {wbe:?})"
+        );
+        drop(rotxn);
+        drop(std::fs::remove_dir_all(&dir));
+    }
 }
 
 fn disconnect_withdrawal_bundle_failed(

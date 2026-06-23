@@ -520,3 +520,59 @@ pub(in crate::state) fn revert_swap(
     pools.put(rwtxn, &amm_pair, &new_amm_pool_state)?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// AMM mint accepts an inflated LP token output.
+//
+// apply_mint() above validates with:
+//     let lp_tokens_minted = new_outstanding.checked_sub(lp_token_mint)?;
+//     if lp_tokens_minted != lp_token_mint { error }
+// i.e. it requires new_outstanding - declared == declared, so it accepts any
+// declared == new_outstanding / 2 instead of the real minted delta
+// (new_outstanding - old_outstanding). This test drives the REAL PoolState::mint
+// math and shows the exact apply_mint comparison accepts a hugely inflated mint
+// while rejecting the correct one.
+#[cfg(test)]
+mod bug_amm_lp_inflation {
+    use super::*;
+    use crate::types::Txid;
+
+    // The exact acceptance condition from apply_mint (amm.rs).
+    fn apply_mint_accepts(new_outstanding: u64, declared_lp_mint: u64) -> bool {
+        match new_outstanding.checked_sub(declared_lp_mint) {
+            Some(lp_tokens_minted) => lp_tokens_minted == declared_lp_mint,
+            None => false,
+        }
+    }
+
+    #[test]
+    fn amm_lp_inflation() {
+        // Seed a real pool via the real mint path: 1000/1000 reserves, 1000 LP.
+        let pool = PoolState::new(Txid::default())
+            .mint(1000, 1000)
+            .expect("seed mint");
+        assert_eq!(pool.outstanding_lp_tokens, 1000);
+
+        // Attacker deposits 2/2. Real AMM formula mints exactly 2 LP.
+        let after = pool.mint(2, 2).expect("attacker mint");
+        let correct_delta = after.outstanding_lp_tokens - pool.outstanding_lp_tokens;
+        assert_eq!(correct_delta, 2, "real AMM mint delta is 2");
+
+        // apply_mint accepts declared == new_outstanding / 2.
+        let inflated = after.outstanding_lp_tokens / 2; // 501
+        assert!(
+            apply_mint_accepts(after.outstanding_lp_tokens, inflated),
+            "buggy apply_mint must ACCEPT the inflated mint of {inflated}"
+        );
+        assert!(
+            !apply_mint_accepts(after.outstanding_lp_tokens, correct_delta),
+            "buggy apply_mint REJECTS the correct mint of {correct_delta} (validates the wrong quantity)"
+        );
+
+        println!(
+            "pool 1000/1000, deposit 2/2 -> correct LP=2, \
+             but apply_mint accepts declared LP={inflated} ({}x inflation)",
+            inflated / correct_delta
+        );
+    }
+}

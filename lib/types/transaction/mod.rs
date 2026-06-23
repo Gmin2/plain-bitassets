@@ -1603,3 +1603,115 @@ impl From<Authorized<FilledTransaction>> for AuthorizedTransaction {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Same-asset Dutch auction inflation.
+//
+// output_asset_total_values handles a DutchAuctionBid's receive before its
+// spend in an `else if` chain. When base_asset == quote_asset (the bid's
+// asset_spend == asset_receive), the receive branch runs first and adds
+// receive_amount; the spend branch is then skipped because the receive branch
+// already cleared the asset. The unprocessed spend is appended later as
+// (spend_asset, None), and filled_outputs has a FIXME and does not reject the
+// leftover. Net: the required output total for the asset is
+// input + receive_amount, with the spend subtraction silently dropped.
+//
+// This test builds a real FilledTransaction (one spent BitAsset A, a
+// DutchAuctionBid receiving the same asset A) and drives the REAL
+// output_asset_total_values, asserting the inflated total.
+#[cfg(test)]
+mod bug_dutch_auction_same_asset {
+    use super::*;
+    use crate::types::{AssetId, BitAssetId, DutchAuctionId};
+
+    fn bitasset_a() -> BitAssetId {
+        BitAssetId([7u8; 32])
+    }
+
+    fn spent_bitasset_a(amount: u64) -> FilledOutput {
+        FilledOutput {
+            address: crate::types::Address([0u8; 20]),
+            content: FilledOutputContent::BitAsset(bitasset_a(), amount),
+            memo: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn same_asset_dutch_auction_inflation() {
+        let asset_a = AssetId::BitAsset(bitasset_a());
+        let input_amount: u64 = 200;
+        let bid_size: u64 = 100; // amount_spend
+        let quantity: u64 = 100; // amount_receive
+
+        // Same-asset bid: receive_asset == the spent asset A.
+        let tx = Transaction {
+            inputs: vec![OutPoint::Regular {
+                txid: Txid::default(),
+                vout: 0,
+            }],
+            outputs: Vec::new(),
+            memo: Vec::new(),
+            data: Some(TransactionData::DutchAuctionBid {
+                auction_id: DutchAuctionId(Txid::default()),
+                receive_asset: asset_a,
+                quantity,
+                bid_size,
+            }),
+        };
+        let filled = FilledTransaction {
+            transaction: tx,
+            spent_utxos: vec![spent_bitasset_a(input_amount)],
+        };
+
+        // Sanity: the derived bid has spend asset == receive asset == A.
+        let bid = filled.dutch_auction_bid().expect("bid");
+        assert_eq!(bid.asset_spend, asset_a);
+        assert_eq!(bid.asset_receive, asset_a);
+        assert_eq!(bid.amount_spend, bid_size);
+        assert_eq!(bid.amount_receive, quantity);
+
+        // Drive the REAL accounting.
+        let totals: Vec<(AssetId, Option<u64>)> =
+            filled.output_asset_total_values().collect();
+
+        // The main per-asset entry for A ran ONLY the receive branch:
+        //   input + receive = 200 + 100 = 300, NOT 200 - 100 + 100 = 200.
+        let main_a = totals
+            .iter()
+            .find(|(asset, amount)| *asset == asset_a && amount.is_some())
+            .expect("an A entry with a concrete value");
+        assert_eq!(
+            main_a.1,
+            Some(input_amount + quantity),
+            "receive added, spend skipped: required A output total is inflated"
+        );
+
+        // Correct same-asset conservation would have been input only (200):
+        let correct_total = input_amount - bid_size + quantity; // 200
+        assert_ne!(
+            main_a.1,
+            Some(correct_total),
+            "buggy total ({:?}) differs from correct conservation ({correct_total})",
+            main_a.1
+        );
+
+        // The skipped spend is appended as a leftover (A, None) entry that
+        // filled_outputs does not reject (the FIXME path).
+        let leftover_none = totals
+            .iter()
+            .filter(|(asset, amount)| *asset == asset_a && amount.is_none())
+            .count();
+        assert_eq!(
+            leftover_none, 1,
+            "the dropped spend is appended as an unconsumed (A, None) entry"
+        );
+
+        println!(
+            "same-asset Dutch auction bid (spend {bid_size} A, \
+             receive {quantity} A) over {input_amount} A input yields required \
+             output total {:?} (correct conservation = {correct_total}); the \
+             spend subtraction was dropped, inflating supply by {quantity}",
+            main_a.1
+        );
+    }
+}

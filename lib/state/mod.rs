@@ -761,3 +761,117 @@ impl Watchable<()> for State {
         tokio_stream::wrappers::WatchStream::new(self.tip.watch().clone())
     }
 }
+
+// ---------------------------------------------------------------------------
+// sidechain_wealth uses the wrong accumulator.
+//
+// In the withdrawal-STXO branch, sidechain_wealth assigns
+//     total_withdrawal_stxo_value = total_deposit_stxo_value.checked_add(value)
+// instead of accumulating into total_withdrawal_stxo_value. With no deposit
+// STXOs and two withdrawal STXOs of 10 and 20 sats, the correct withdrawal
+// total is 30, but the buggy code computes 10 then overwrites it with 20.
+//
+// This test opens a REAL state env, writes two real withdrawal SpentOutputs,
+// and calls the REAL State::sidechain_wealth, asserting the buggy value.
+#[cfg(test)]
+mod bug_sidechain_wealth_accounting {
+    use super::*;
+    use crate::types::{
+        Address, BitcoinOutputContent, FilledOutput, FilledOutputContent,
+        InPoint, OutPoint, OutPointKey, SpentOutput, Txid,
+    };
+    use bitcoin::hashes::Hash as _;
+
+    fn open_env(path: &std::path::Path) -> sneed::Env {
+        std::fs::create_dir_all(path).unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(10 * 1024 * 1024)
+            .max_dbs(State::NUM_DBS);
+        unsafe { sneed::Env::open(&opts, path) }.unwrap()
+    }
+
+    fn withdrawal_stxo(value_sats: u64) -> SpentOutput {
+        SpentOutput {
+            output: FilledOutput {
+                address: Address([0u8; 20]),
+                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
+                    bitcoin::Amount::from_sat(value_sats),
+                )),
+                memo: Vec::new(),
+            },
+            inpoint: InPoint::Withdrawal {
+                m6id: crate::types::M6id(bitcoin::Txid::all_zeros()),
+            },
+        }
+    }
+
+    #[test]
+    fn sidechain_wealth_wrong_accumulator() {
+        let dir = std::env::temp_dir()
+            .join(format!("pba_sidechain_wealth_{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        let env = open_env(&dir);
+        let state = State::new(&env).unwrap();
+
+        // Two withdrawal STXOs of 10 and 20 sats (keyed as Regular outpoints so
+        // they only hit the withdrawal branch, not the deposit-STXO branch),
+        // plus a 1000-sat deposit UTXO base so the subtraction never underflows.
+        let mut rwtxn = env.write_txn().unwrap();
+        let k0 = OutPointKey::from(OutPoint::Regular {
+            txid: Txid([1u8; 32]),
+            vout: 0,
+        });
+        let k1 = OutPointKey::from(OutPoint::Regular {
+            txid: Txid([2u8; 32]),
+            vout: 0,
+        });
+        state.stxos.put(&mut rwtxn, &k0, &withdrawal_stxo(10)).unwrap();
+        state.stxos.put(&mut rwtxn, &k1, &withdrawal_stxo(20)).unwrap();
+        // Deposit UTXO of 1000 sats so total_deposit_utxo_value = 1000.
+        let dep_key = OutPointKey::from(OutPoint::Deposit(
+            bitcoin::OutPoint {
+                txid: bitcoin::Txid::all_zeros(),
+                vout: 0,
+            },
+        ));
+        let dep_out = FilledOutput {
+            address: Address([0u8; 20]),
+            content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
+                bitcoin::Amount::from_sat(1000),
+            )),
+            memo: Vec::new(),
+        };
+        state.utxos.put(&mut rwtxn, &dep_key, &dep_out).unwrap();
+        rwtxn.commit().unwrap();
+
+        let rotxn = env.read_txn().unwrap();
+        let wealth = state.sidechain_wealth(&rotxn).unwrap();
+
+        // Correct: 1000 deposit - (10 + 20) = 970.
+        // Buggy: withdrawal total is overwritten to a single value (10 or 20,
+        // depending on stxo iteration order), so wealth is 990 or 980, never
+        // 970.
+        let correct = bitcoin::Amount::from_sat(970);
+        assert_ne!(
+            wealth, correct,
+            "buggy sidechain_wealth must not equal the correct 970"
+        );
+        let buggy_980 = bitcoin::Amount::from_sat(980);
+        let buggy_990 = bitcoin::Amount::from_sat(990);
+        assert!(
+            wealth == buggy_980 || wealth == buggy_990,
+            "wealth {wealth} is one of the buggy single-value results (980/990)"
+        );
+
+        let overreport = wealth - correct;
+        println!(
+            "deposit 1000, withdrawals 10+20 -> correct wealth \
+             970 but sidechain_wealth reported {wealth} (overreport {overreport}); \
+             withdrawal total used the deposit accumulator base instead of \
+             accumulating withdrawals"
+        );
+
+        drop(rotxn);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+}
