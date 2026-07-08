@@ -705,3 +705,147 @@ pub fn disconnect_tip(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use bitcoin::hashes::Hash as _;
+    use sneed::Env;
+
+    use super::*;
+    use crate::{
+        authorization::{SigningKey, authorize, get_address},
+        types::{BitAssetData, Output, OutputContent, Transaction, Txid},
+    };
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "plain-bitassets-state-test-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            drop(std::fs::remove_dir_all(&self.0));
+        }
+    }
+
+    fn test_state() -> (TestDir, Env, State) {
+        let dir = TestDir::new();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(10 * 1024 * 1024).max_dbs(State::NUM_DBS);
+        let env = unsafe { Env::open(&opts, dir.path()) }.unwrap();
+        let state = State::new(&env).unwrap();
+        (dir, env, state)
+    }
+
+    #[test]
+    fn registration_with_wrong_reservation_commitment_prevalidates_then_panics()
+    {
+        let (_tempdir, env, state) = test_state();
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let address = get_address(&signing_key.verifying_key().into());
+
+        let reservation_txid = Txid::from([1; 32]);
+        let wrong_commitment = [2; 32];
+        let reservation_outpoint = OutPoint::Regular {
+            txid: reservation_txid,
+            vout: 0,
+        };
+
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            let reservation_output = FilledOutput {
+                address,
+                content: FilledOutputContent::BitAssetReservation(
+                    reservation_txid,
+                    wrong_commitment,
+                ),
+                memo: Vec::new(),
+            };
+            state
+                .utxos
+                .put(
+                    &mut rwtxn,
+                    &OutPointKey::from_outpoint(&reservation_outpoint),
+                    &reservation_output,
+                )
+                .unwrap();
+            state
+                .bitassets
+                .put_reservation(
+                    &mut rwtxn,
+                    &reservation_txid,
+                    &wrong_commitment,
+                )
+                .unwrap();
+            rwtxn.commit().unwrap();
+        }
+
+        let name_hash = [3; 32];
+        let revealed_nonce = [4; 32];
+        let mut registration = Transaction::new(
+            vec![reservation_outpoint],
+            vec![
+                Output::new(address, OutputContent::BitAsset(1)),
+                Output::new(address, OutputContent::BitAssetControl),
+            ],
+        );
+        registration.data = Some(TxData::BitAssetRegistration {
+            name_hash,
+            revealed_nonce,
+            bitasset_data: Box::<BitAssetData>::default(),
+            initial_supply: 1,
+        });
+
+        let authorized_registration =
+            authorize(&[(address, &signing_key)], registration).unwrap();
+        let body = Body::new(vec![authorized_registration], vec![]);
+        let header = Header {
+            merkle_root: Body::compute_merkle_root(
+                &body.coinbase,
+                &body.transactions,
+            ),
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+        };
+
+        let prevalidated = {
+            let rotxn = env.read_txn().unwrap();
+            state.prevalidate_block(&rotxn, &header, &body).unwrap()
+        };
+
+        let panic_result = std::panic::catch_unwind(|| {
+            let mut rwtxn = env.write_txn().unwrap();
+            state
+                .connect_prevalidated_block(
+                    &mut rwtxn,
+                    &header,
+                    &body,
+                    prevalidated,
+                )
+                .unwrap();
+        });
+
+        assert!(panic_result.is_err());
+    }
+}
